@@ -1,0 +1,7 @@
+# touchpad-scroll configuration
+#
+# Higher values produce slower scrolling.
+# Lower values produce faster scrolling.
+# The libinput default is commonly 15.
+
+SCROLL_DISTANCE=45
