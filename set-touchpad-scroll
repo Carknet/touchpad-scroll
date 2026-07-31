@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+
+set -u
+
+PROPERTY="libinput Scrolling Pixel Distance"
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/touchpad-scroll.conf"
+SCROLL_DISTANCE="${SCROLL_DISTANCE:-45}"
+
+if [[ -r "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+fi
+
+if ! command -v xinput >/dev/null 2>&1; then
+    logger -t touchpad-scroll "xinput is not installed"
+    printf 'touchpad-scroll: xinput is not installed\n' >&2
+    exit 1
+fi
+
+if [[ -z "${DISPLAY:-}" ]]; then
+    logger -t touchpad-scroll "DISPLAY is not set; an X11 session is required"
+    printf 'touchpad-scroll: DISPLAY is not set; an X11 session is required\n' >&2
+    exit 1
+fi
+
+if ! [[ "$SCROLL_DISTANCE" =~ ^[0-9]+$ ]] || (( SCROLL_DISTANCE < 1 )); then
+    printf 'touchpad-scroll: SCROLL_DISTANCE must be a positive integer\n' >&2
+    exit 1
+fi
+
+DEVICE_ID=""
+DEVICE_NAME=""
+
+while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+
+    if xinput list-props "$id" 2>/dev/null | grep -Fq "$PROPERTY"; then
+        DEVICE_ID="$id"
+        DEVICE_NAME="$(xinput list --name-only "$id" 2>/dev/null || printf 'device %s' "$id")"
+        break
+    fi
+done < <(xinput list --short | sed -n 's/.*id=\([0-9][0-9]*\).*/\1/p')
+
+if [[ -z "$DEVICE_ID" ]]; then
+    logger -t touchpad-scroll "No compatible touchpad found"
+    printf 'touchpad-scroll: no device exposing "%s" was found\n' "$PROPERTY" >&2
+    exit 1
+fi
+
+if xinput set-prop "$DEVICE_ID" "$PROPERTY" "$SCROLL_DISTANCE"; then
+    logger -t touchpad-scroll "Set $DEVICE_NAME ($DEVICE_ID) scroll distance to $SCROLL_DISTANCE"
+    printf 'touchpad-scroll: set "%s" to %s on %s\n' "$PROPERTY" "$SCROLL_DISTANCE" "$DEVICE_NAME"
+else
+    logger -t touchpad-scroll "Failed to configure $DEVICE_NAME ($DEVICE_ID)"
+    printf 'touchpad-scroll: failed to configure %s\n' "$DEVICE_NAME" >&2
+    exit 1
+fi
