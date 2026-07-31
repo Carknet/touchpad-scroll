@@ -1,28 +1,54 @@
 # touchpad-scroll
 
-A small X11/libinput helper that sets a custom touchpad scroll distance at login.
+A small, lightweight utility for adjusting libinput touchpad scroll speed on **X11**.
 
-It searches for the first XInput device exposing the property:
+Many Linux desktops expose the XInput property:
 
 ```text
 libinput Scrolling Pixel Distance
 ```
 
-A higher value means slower scrolling. The default value is often `15`; this project uses `45` by default.
+but provide no graphical control for it. `touchpad-scroll` automatically finds a compatible touchpad and applies your preferred scroll distance each time you log in.
+
+## Features
+
+- Automatic compatible-device detection
+- No hard-coded XInput device ID
+- Per-user configuration
+- Automatic startup at login
+- No root privileges required after `xinput` is installed
+- Installer and uninstaller included
+- ShellCheck validation through GitHub Actions
+
+## How the value works
+
+The default scroll distance is commonly `15`.
+
+- **Higher value** = slower scrolling
+- **Lower value** = faster scrolling
+
+This project uses `45` by default.
 
 ## Requirements
 
-- X11 session
+- An X11 desktop session
 - `xinput`
-- A libinput touchpad exposing `libinput Scrolling Pixel Distance`
+- A libinput device exposing `libinput Scrolling Pixel Distance`
 
-On Debian, Kali, or Ubuntu:
+Install `xinput` on Debian, Kali, or Ubuntu:
 
 ```bash
 sudo apt install xinput
 ```
 
-## Install
+Check whether your touchpad exposes the required property:
+
+```bash
+xinput list
+xinput list-props "YOUR TOUCHPAD NAME" | grep "Scrolling Pixel Distance"
+```
+
+## Installation
 
 ```bash
 git clone https://github.com/Carknet/touchpad-scroll.git
@@ -31,49 +57,118 @@ chmod +x install.sh uninstall.sh set-touchpad-scroll
 ./install.sh
 ```
 
-Log out and back in, or test immediately with:
+The installer creates:
+
+```text
+~/.local/bin/set-touchpad-scroll
+~/.config/autostart/touchpad-scroll.desktop
+~/.config/touchpad-scroll.conf
+```
+
+Log out and back in, or apply the setting immediately:
 
 ```bash
 ~/.local/bin/set-touchpad-scroll
 ```
 
-## Change the speed
+## Configuration
 
-Edit this line in `~/.local/bin/set-touchpad-scroll`:
+Edit:
+
+```bash
+nano ~/.config/touchpad-scroll.conf
+```
+
+Example:
 
 ```bash
 SCROLL_DISTANCE=45
 ```
 
-- Higher value: slower scrolling
-- Lower value: faster scrolling
-
-Then run:
+Apply the new value immediately:
 
 ```bash
 ~/.local/bin/set-touchpad-scroll
 ```
 
-## Verify
+You may also override the value for one run:
 
 ```bash
-xinput list-props "ELAN1300:00 04F3:3032 Touchpad" | grep "Scrolling Pixel Distance"
+SCROLL_DISTANCE=30 ~/.local/bin/set-touchpad-scroll
 ```
 
-Or inspect all compatible devices:
+## Example output
+
+```text
+touchpad-scroll: set "libinput Scrolling Pixel Distance" to 45 on ELAN1300:00 04F3:3032 Touchpad
+```
+
+## Troubleshooting
+
+### `xinput is not installed`
+
+Install it using your distribution's package manager, for example:
 
 ```bash
-xinput list --id-only | while read -r id; do
-  xinput list-props "$id" 2>/dev/null | grep -H "Scrolling Pixel Distance"
-done
+sudo apt install xinput
 ```
 
-## Uninstall
+### `DISPLAY is not set`
+
+The utility must run inside an active X11 graphical session. It is not currently intended for Wayland.
+
+### No compatible device found
+
+Confirm that a device exposes the required property:
+
+```bash
+xinput list --short
+```
+
+Then inspect likely touchpad devices:
+
+```bash
+xinput list-props "DEVICE NAME"
+```
+
+### View log messages
+
+```bash
+journalctl --user -t touchpad-scroll
+```
+
+Depending on the distribution, messages may instead be available in the system journal:
+
+```bash
+journalctl -t touchpad-scroll
+```
+
+## Uninstallation
+
+From the cloned repository:
 
 ```bash
 ./uninstall.sh
 ```
 
-## Notes
+The uninstaller removes the executable and autostart entry, but deliberately keeps your configuration file.
 
-This is intentionally a simple per-user X11 solution. It does not patch libinput, install a system-wide quirk, or require root after `xinput` is installed.
+Remove the configuration too when desired:
+
+```bash
+rm ~/.config/touchpad-scroll.conf
+```
+
+## Limitations
+
+- X11 only
+- Changes the first detected device exposing `libinput Scrolling Pixel Distance`
+- Availability of the property depends on the installed Xorg/libinput stack
+
+## Project origin
+
+This project began with a simple attempt to slow down touchpad scrolling on Kali Linux. That attempt unexpectedly turned into a full Kali upgrade and eventually revealed that modern libinput/XInput already exposed the exact property needed. The final solution was much smaller than the journey that produced it. 😄
+
+## License
+
+MIT — see [LICENSE](LICENSE).
