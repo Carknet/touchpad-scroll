@@ -4,29 +4,75 @@ set -u
 
 PROPERTY="libinput Scrolling Pixel Distance"
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/touchpad-scroll.conf"
-SCROLL_DISTANCE="${SCROLL_DISTANCE:-45}"
-DEVICE_NAME="${DEVICE_NAME:-}"
+
+# Capture environment overrides BEFORE the config file is sourced. Sourcing
+# assigns unconditionally, so without this the documented one-shot override
+#   SCROLL_DISTANCE=30 set-touchpad-scroll
+# is silently discarded whenever a config file exists -- which is always,
+# since the installer writes one.
+ENV_SCROLL_DISTANCE="${SCROLL_DISTANCE:-}"
+ENV_DEVICE_NAME="${DEVICE_NAME:-}"
+
+SCROLL_DISTANCE=45
+DEVICE_NAME=""
+
+# Upper limit for range discovery. Purely a safety stop so a driver that
+# accepts everything cannot spin the probe loop forever.
+PROBE_CEILING=4096
+
+PROBE_ONLY=0
+
+usage() {
+    cat <<'EOF'
+Usage: set-touchpad-scroll [--probe] [--help]
+
+  --probe   Report the range of scroll distances the current driver accepts,
+            then restore the existing value. Changes nothing permanently.
+  --help    Show this message.
+
+Configuration: ${XDG_CONFIG_HOME:-$HOME/.config}/touchpad-scroll.conf
+  SCROLL_DISTANCE=45    higher is slower
+  DEVICE_NAME=...       optional, overrides auto-detection
+EOF
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        --probe) PROBE_ONLY=1 ;;
+        --help|-h) usage; exit 0 ;;
+        *) printf 'touchpad-scroll: unknown argument: %s\n' "$arg" >&2
+           usage >&2; exit 2 ;;
+    esac
+done
 
 if [[ -r "$CONFIG_FILE" ]]; then
     # shellcheck disable=SC1090
     source "$CONFIG_FILE"
 fi
 
-if ! command -v xinput >/dev/null 2>&1; then
-    logger -t touchpad-scroll "xinput is not installed"
-    printf 'touchpad-scroll: xinput is not installed\n' >&2
-    exit 1
-fi
+# Environment wins over the config file.
+[[ -n "$ENV_SCROLL_DISTANCE" ]] && SCROLL_DISTANCE="$ENV_SCROLL_DISTANCE"
+[[ -n "$ENV_DEVICE_NAME" ]] && DEVICE_NAME="$ENV_DEVICE_NAME"
 
-if [[ -z "${DISPLAY:-}" ]]; then
-    logger -t touchpad-scroll "DISPLAY is not set; an X11 session is required"
-    printf 'touchpad-scroll: DISPLAY is not set; an X11 session is required\n' >&2
-    exit 1
-fi
+die() {
+    logger -t touchpad-scroll "$1"
+    printf 'touchpad-scroll: %s\n' "$1" >&2
+    exit "${2:-1}"
+}
+
+warn() {
+    logger -t touchpad-scroll "$1"
+    printf 'touchpad-scroll: %s\n' "$1" >&2
+}
+
+command -v xinput >/dev/null 2>&1 \
+    || die "xinput is not installed"
+
+[[ -n "${DISPLAY:-}" ]] \
+    || die "DISPLAY is not set; an X11 session is required"
 
 if ! [[ "$SCROLL_DISTANCE" =~ ^[0-9]+$ ]] || (( SCROLL_DISTANCE < 1 )); then
-    printf 'touchpad-scroll: SCROLL_DISTANCE must be a positive integer\n' >&2
-    exit 1
+    die "SCROLL_DISTANCE must be a positive integer, got: $SCROLL_DISTANCE"
 fi
 
 DEVICE_ID=""
@@ -38,16 +84,11 @@ FALLBACK_NAME=""
 if [[ -n "${DEVICE_NAME:-}" ]]; then
     DEVICE_ID="$(xinput list --id-only "$DEVICE_NAME" 2>/dev/null || true)"
 
-    if [[ -z "$DEVICE_ID" ]]; then
-        printf 'touchpad-scroll: configured device was not found: %s\n' "$DEVICE_NAME" >&2
-        exit 1
-    fi
+    [[ -n "$DEVICE_ID" ]] \
+        || die "configured device was not found: $DEVICE_NAME"
 
-    if ! xinput list-props "$DEVICE_ID" 2>/dev/null | grep -Fq "$PROPERTY"; then
-        printf 'touchpad-scroll: configured device does not expose "%s": %s\n' \
-            "$PROPERTY" "$DEVICE_NAME" >&2
-        exit 1
-    fi
+    xinput list-props "$DEVICE_ID" 2>/dev/null | grep -Fq "$PROPERTY" \
+        || die "configured device does not expose \"$PROPERTY\": $DEVICE_NAME"
 
     SELECTED_NAME="$DEVICE_NAME"
 else
@@ -60,7 +101,7 @@ else
         name="$(xinput list --name-only "$id" 2>/dev/null || printf 'device %s' "$id")"
 
         # Some hardware is exposed as both Mouse and Touchpad. Prefer the
-        # actual touchpad node rather than whichever compatible node appears first.
+        # actual touchpad node rather than whichever node appears first.
         if [[ "$name" =~ [Tt]ouchpad ]]; then
             DEVICE_ID="$id"
             SELECTED_NAME="$name"
@@ -79,18 +120,187 @@ else
     fi
 fi
 
-if [[ -z "$DEVICE_ID" ]]; then
-    logger -t touchpad-scroll "No compatible touchpad found"
-    printf 'touchpad-scroll: no device exposing "%s" was found\n' "$PROPERTY" >&2
-    exit 1
+[[ -n "$DEVICE_ID" ]] \
+    || die "no device exposing \"$PROPERTY\" was found"
+
+# --- range discovery ------------------------------------------------------
+#
+# XInput exposes no minimum or maximum for this property. The libinput X
+# driver validates the value internally and rejects anything outside its
+# accepted range with a raw X BadValue error.
+#
+# That range is NOT stable across drivers or devices, and it cannot be
+# queried: there is no API for it. So we probe -- but only when a value is
+# actually refused, which means the normal path costs zero extra calls.
+#
+# Note: this driver also accepts 9999, an isolated value far outside its
+# normal band (10-50 here). Its meaning is undocumented upstream. Because it
+# is isolated, a binary search will never land on it, and clamping treats it
+# as out of range -- which is the sane outcome for a scroll distance.
+
+current_value() {
+    xinput list-props "$DEVICE_ID" 2>/dev/null \
+        | sed -n "s/.*${PROPERTY} ([0-9]\{1,\}):[[:space:]]*\([0-9]\{1,\}\).*/\1/p" \
+        | head -1
+}
+
+# The driver publishes its own default alongside the live value. That is a
+# stable reference point; the live value is not. Anchoring discovery on the
+# live value breaks whenever the device happens to be sitting on an outlier
+# (e.g. the 9999 sentinel), because every probe then starts from there and
+# the reported range comes back as garbage like 8714-9999.
+default_value() {
+    xinput list-props "$DEVICE_ID" 2>/dev/null \
+        | sed -n "s/.*${PROPERTY} Default ([0-9]\{1,\}):[[:space:]]*\([0-9]\{1,\}\).*/\1/p" \
+        | head -1
+}
+
+# Attempt to set a value. Silent: the caller decides what a failure means.
+try_value() {
+    xinput set-prop "$DEVICE_ID" "$PROPERTY" "$1" 2>/dev/null
+}
+
+# Probe a value from a FIXED anchor.
+#
+# A successful set changes the current value, and the driver's answer can
+# depend on where it is starting from. Probing sequentially therefore moves
+# the ground under the measurement: an accepted outlier (this driver accepts
+# 9999, well outside its normal 10-50 band) drags every later probe with it
+# and the discovered "range" becomes nonsense. Resetting first makes each
+# probe independent.
+PROBE_ANCHOR=""
+probe_value() {
+    xinput set-prop "$DEVICE_ID" "$PROPERTY" "$PROBE_ANCHOR" 2>/dev/null
+    xinput set-prop "$DEVICE_ID" "$PROPERTY" "$1" 2>/dev/null
+}
+
+# Exponential search outward from a known-good anchor, then binary search
+# the boundary. Returns the largest accepted value.
+discover_max() {
+    local good="$1" hi bad=0 mid
+    hi=$(( good * 2 ))
+    (( hi <= good )) && hi=$(( good + 1 ))
+
+    while (( hi <= PROBE_CEILING )); do
+        if probe_value "$hi"; then
+            good="$hi"
+            hi=$(( hi * 2 ))
+        else
+            bad="$hi"
+            break
+        fi
+    done
+
+    (( bad == 0 )) && { printf '%s' "$good"; return; }
+
+    while (( bad - good > 1 )); do
+        mid=$(( (good + bad) / 2 ))
+        if probe_value "$mid"; then good="$mid"; else bad="$mid"; fi
+    done
+    printf '%s' "$good"
+}
+
+# Same, downward. Returns the smallest accepted value.
+discover_min() {
+    local good="$1" lo bad=0 mid
+    lo=$(( good / 2 ))
+    (( lo < 1 )) && lo=1
+
+    while true; do
+        if probe_value "$lo"; then
+            good="$lo"
+            (( lo == 1 )) && break
+            lo=$(( lo / 2 ))
+            (( lo < 1 )) && lo=1
+        else
+            bad="$lo"
+            break
+        fi
+    done
+
+    (( bad == 0 )) && { printf '%s' "$good"; return; }
+
+    while (( good - bad > 1 )); do
+        mid=$(( (good + bad) / 2 ))
+        if probe_value "$mid"; then good="$mid"; else bad="$mid"; fi
+    done
+    printf '%s' "$good"
+}
+
+apply_and_report() {
+    local value="$1"
+    if try_value "$value"; then
+        logger -t touchpad-scroll \
+            "Set $SELECTED_NAME ($DEVICE_ID) scroll distance to $value"
+        printf 'touchpad-scroll: set "%s" to %s on %s\n' \
+            "$PROPERTY" "$value" "$SELECTED_NAME"
+        return 0
+    fi
+    return 1
+}
+
+ORIGINAL="$(current_value)"
+
+# Probing walks the property through many values. If anything interrupts us
+# mid-probe, put the device back the way we found it rather than leaving it
+# on whatever the last successful probe happened to be.
+restore_original() {
+    [[ -n "$ORIGINAL" ]] && try_value "$ORIGINAL"
+}
+
+# Choose the anchor for range discovery: the driver's published default
+# first, the live value only as a fallback. Verified accepted before use.
+pick_anchor() {
+    local candidate
+    for candidate in "$(default_value)" "${ORIGINAL:-}"; do
+        [[ -n "$candidate" ]] || continue
+        if try_value "$candidate"; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if [[ $PROBE_ONLY -eq 1 ]]; then
+    trap restore_original EXIT INT TERM
+    anchor="$(pick_anchor)" \
+        || die "cannot establish a usable anchor for \"$PROPERTY\" on $SELECTED_NAME"
+    PROBE_ANCHOR="$anchor"
+    min="$(discover_min "$anchor")"
+    max="$(discover_max "$anchor")"
+    printf 'touchpad-scroll: %s accepts %s-%s on %s (currently %s, driver default %s)\n' \
+        "$PROPERTY" "$min" "$max" "$SELECTED_NAME" "${ORIGINAL:-unknown}" "$(default_value)"
+    exit 0
 fi
 
-if xinput set-prop "$DEVICE_ID" "$PROPERTY" "$SCROLL_DISTANCE"; then
-    logger -t touchpad-scroll "Set $SELECTED_NAME ($DEVICE_ID) scroll distance to $SCROLL_DISTANCE"
-    printf 'touchpad-scroll: set "%s" to %s on %s\n' \
-        "$PROPERTY" "$SCROLL_DISTANCE" "$SELECTED_NAME"
+# Fast path: the configured value is fine. No probing, no side effects.
+apply_and_report "$SCROLL_DISTANCE" && exit 0
+
+# Rejected. Work out the real range and clamp into it, rather than bailing
+# out and silently leaving the user on the driver default -- which is the
+# failure mode that made this rewrite necessary.
+trap restore_original EXIT INT TERM
+
+anchor="$(pick_anchor)" \
+    || die "\"$PROPERTY\" rejected $SCROLL_DISTANCE on $SELECTED_NAME, and no working anchor could be established"
+
+PROBE_ANCHOR="$anchor"
+min="$(discover_min "$anchor")"
+max="$(discover_max "$anchor")"
+
+if (( SCROLL_DISTANCE > max )); then
+    target="$max"
+elif (( SCROLL_DISTANCE < min )); then
+    target="$min"
 else
-    logger -t touchpad-scroll "Failed to configure $SELECTED_NAME ($DEVICE_ID)"
-    printf 'touchpad-scroll: failed to configure %s\n' "$SELECTED_NAME" >&2
-    exit 1
+    trap - EXIT INT TERM
+    restore_original
+    die "\"$PROPERTY\" rejected $SCROLL_DISTANCE on $SELECTED_NAME even though the accepted range is $min-$max; this is a driver-level refusal, not a range problem"
 fi
+
+warn "SCROLL_DISTANCE=$SCROLL_DISTANCE is outside the range this driver accepts ($min-$max); clamping to $target. Update $CONFIG_FILE to silence this."
+
+trap - EXIT INT TERM
+apply_and_report "$target" \
+    || die "failed to apply clamped value $target on $SELECTED_NAME"

@@ -3,5 +3,12 @@
 # Higher values produce slower scrolling.
 # Lower values produce faster scrolling.
 # The libinput default is commonly 15.
+#
+# The range your driver accepts is not published anywhere and varies by
+# device. Find yours with:
+#
+#     set-touchpad-scroll --probe
+#
+# A value outside that range is clamped into it, with a warning.
 
 SCROLL_DISTANCE=45
